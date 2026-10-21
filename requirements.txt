@@ -1,0 +1,4 @@
+pymysql>=1.1
+requests>=2.31
+cloudinary>=1.40
+python-dotenv>=1.0
