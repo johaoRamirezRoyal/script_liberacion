@@ -2,9 +2,11 @@
 
     python migrar.py --probar-conexiones
     python migrar.py [--tablas firmas,recaudo] [--lote 5] [--max-mb-lote 8] [--limite 50]
+    python migrar.py --borrar-subidos salida/<fecha>/subidos.csv [--confirmar]
 
 Salidas en salida/<fecha>/: migracion.log (una línea por archivo), resultados.csv
-(mapeo fila → URL de Cloudinary) y reporte.txt (% de éxito por tabla.columna).
+(mapeo fila → URL de Cloudinary), subidos.csv (archivos únicos ya en Cloudinary) y
+reporte.txt (% de éxito por tabla.columna).
 """
 
 import argparse
@@ -12,7 +14,7 @@ import csv
 import logging
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -27,6 +29,7 @@ from conexiones import (
     columnas_existentes,
     conectar_bd,
     configurar_cloudinary,
+    existe_en_url,
     leer_valores,
     ping_cloudinary,
 )
@@ -194,6 +197,17 @@ def escribir_csv(registros: list[Registro], ruta: Path) -> None:
                         r.public_id, r.url, r.mensaje])
 
 
+def escribir_subidos(registros: list[Registro], ruta: Path) -> None:
+    """Un archivo por fila (sin repetir) de los que quedaron en Cloudinary: base para borrarlos del disco."""
+    subidos = {r.ruta_rel: r for r in registros if r.estado == SUBIDO}
+    with ruta.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["nombre", "ruta_local", "public_id", "url"])
+        for ruta_rel in sorted(subidos):
+            r = subidos[ruta_rel]
+            w.writerow([PurePosixPath(ruta_rel).name, ruta_rel, r.public_id, r.url])
+
+
 def escribir_reporte(registros: list[Registro], ruta: Path, interrumpido: bool) -> str:
     """% éxito = subidos / (subidos + fallidos): sobre lo que se intentó subir. Los omitidos
     (URL externa, sin extensión) y los pendientes (corrida interrumpida o --limite) van aparte."""
@@ -227,6 +241,54 @@ def escribir_reporte(registros: list[Registro], ruta: Path, interrumpido: bool) 
     texto = "\n".join(lineas) + "\n"
     ruta.write_text(texto, encoding="utf-8")
     return texto
+
+
+# ---------- Borrado del disco ----------
+
+def borrar_subidos(raiz: Path, archivo_csv: Path, confirmar: bool, existe_en_nube, conteo: Counter) -> None:
+    """Borra del disco los archivos de un subidos.csv que siguen respondiendo en Cloudinary.
+    Sin `confirmar` solo simula. `conteo` es del llamador para no perderlo con un Ctrl+C."""
+    with archivo_csv.open(newline="", encoding="utf-8") as f:
+        filas = list(csv.DictReader(f))
+    if filas and not {"ruta_local", "public_id", "url"} <= filas[0].keys():
+        raise ValueError(f"{archivo_csv} no tiene las columnas de subidos.csv (ruta_local, public_id, url)")
+
+    # a.jpg y a.png en la misma carpeta comparten public_id: Cloudinary guardó solo el último
+    # y la URL del otro igual responde 200, así que no se borra ninguno de los dos.
+    repetidos = {p for p, n in Counter(fila["public_id"] for fila in filas).items() if n > 1}
+    raiz = raiz.resolve()
+    log.info("%d archivos en %s", len(filas), archivo_csv)
+
+    for fila in filas:
+        ruta_rel = fila["ruta_local"]
+        ruta = (raiz / ruta_rel).resolve()
+        if not ruta.is_relative_to(raiz) or ruta == raiz:
+            motivo = "la ruta queda fuera de UPLOAD_ROOT"
+        elif fila["public_id"] in repetidos:
+            motivo = f"public_id {fila['public_id']} repetido en el CSV, Cloudinary guardó solo uno"
+        elif not ruta.is_file():
+            conteo["ya no existía"] += 1
+            log.info("[YA NO EXISTE] %s", ruta_rel)
+            continue
+        elif not existe_en_nube(fila["url"]):
+            motivo = f"no responde en Cloudinary ({fila['url'] or 'sin url'})"
+        else:
+            motivo = ""
+
+        if not motivo and confirmar:
+            try:
+                ruta.unlink()
+            except OSError as e:
+                motivo = f"no se pudo borrar: {e}"
+        if motivo:
+            conteo["no borrados"] += 1
+            log.error("[NO BORRADO] %s — %s", ruta_rel, motivo)
+        elif confirmar:
+            conteo["borrados"] += 1
+            log.info("[BORRADO] %s", ruta_rel)
+        else:
+            conteo["se borrarían"] += 1
+            log.info("[SIMULACIÓN] se borraría %s", ruta_rel)
 
 
 # ---------- Comandos ----------
@@ -311,9 +373,33 @@ def migrar(cfg: config.Config, args) -> int:
         codigo = 2
     finally:
         escribir_csv(registros, salida / "resultados.csv")
+        escribir_subidos(registros, salida / "subidos.csv")
         print("\n" + escribir_reporte(registros, salida / "reporte.txt", interrumpido))
         log.info("Salidas en %s", salida)
 
+    return codigo
+
+
+def borrar(cfg: config.Config, args) -> int:
+    salida = config.DIRECTORIO_SCRIPT / "salida" / f"{datetime.now():%Y%m%d_%H%M%S}_borrado"
+    salida.mkdir(parents=True)
+    agregar_log_archivo(salida / "borrado.log")
+    if not args.confirmar:
+        log.warning("SIMULACIÓN: no se borra nada. Agrega --confirmar para borrar de verdad.")
+
+    conteo: Counter = Counter()
+    try:
+        borrar_subidos(cfg.upload_root, Path(args.borrar_subidos), args.confirmar, existe_en_url, conteo)
+        codigo = 1 if conteo["no borrados"] else 0
+    except KeyboardInterrupt:
+        log.warning("Interrumpido por el usuario (Ctrl+C).")
+        codigo = 130
+    except (OSError, ValueError, csv.Error, KeyError) as e:
+        log.critical("No se pudo leer el CSV: %s", e)
+        codigo = 2
+    finally:
+        log.info("Resumen: %s", ", ".join(f"{k}={v}" for k, v in sorted(conteo.items())) or "nada procesado")
+        log.info("Log en %s", salida / "borrado.log")
     return codigo
 
 
@@ -345,7 +431,13 @@ def main() -> int:
                         help="Peso máximo por petición en MB (por defecto 8 = post_max_size por defecto de PHP).")
     parser.add_argument("--limite", type=entero_en_rango(1, 10**9),
                         help="Sube como máximo N archivos únicos (para pruebas).")
+    parser.add_argument("--borrar-subidos", metavar="CSV",
+                        help="Borra del disco los archivos de un subidos.csv que responden en Cloudinary. "
+                             "Sin --confirmar solo simula.")
+    parser.add_argument("--confirmar", action="store_true", help="Con --borrar-subidos: borra de verdad.")
     args = parser.parse_args()
+    if args.confirmar and not args.borrar_subidos:
+        parser.error("--confirmar solo se usa con --borrar-subidos")
 
     # La consola de Windows (cp1252) no imprime tildes ni flechas sin esto.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -359,6 +451,9 @@ def main() -> int:
 
     if args.probar_conexiones:
         return 0 if probar_conexiones(cfg) else 1
+
+    if args.borrar_subidos:
+        return borrar(cfg, args)
 
     configurar_cloudinary(cfg)
     return migrar(cfg, args)

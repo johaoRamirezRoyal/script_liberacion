@@ -71,6 +71,19 @@ def ping_cloudinary() -> dict:
     return cloudinary.api.ping()
 
 
+_sesion_head = requests.Session()
+# HEAD sí se reintenta por defecto: errores de red y 5xx con backoff.
+_sesion_head.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=2, status_forcelist=(500, 502, 503, 504))))
+
+
+def existe_en_url(url: str) -> bool:
+    """HEAD a la URL pública de Cloudinary. No usa el Admin API (tiene límite de llamadas por hora)."""
+    try:
+        return _sesion_head.head(url, timeout=(10, 30), allow_redirects=True).status_code == 200
+    except requests.RequestException:
+        return False
+
+
 # ---------- Endpoint de migración ----------
 
 class ClienteMigracion:
