@@ -114,7 +114,14 @@ def recolectar(conn, cfg: config.Config, fuentes: list[Fuente], indice, registro
                 terminar(reg, OMITIDO, "no es un archivo (sin extensión)")
                 continue
 
-            ruta, aviso = resolver_ruta(limpio, cfg.upload_root, indice)
+            # Un valor basura (p. ej. el binario de una imagen guardado como texto) o un archivo
+            # sin permisos falla solo esa fila, no toda la corrida.
+            try:
+                ruta, aviso = resolver_ruta(limpio, cfg.upload_root, indice)
+                tamano = (cfg.upload_root / ruta).stat().st_size if ruta else 0
+            except OSError as e:
+                terminar(reg, FALLIDO, f"valor no válido como archivo ({e.strerror})")
+                continue
             if ruta is None:
                 terminar(reg, FALLIDO, aviso or "no existe en disco")
                 continue
@@ -122,7 +129,6 @@ def recolectar(conn, cfg: config.Config, fuentes: list[Fuente], indice, registro
                 log.warning("[AVISO] %s id=%s %s: %s", fuente.clave, id_fila, limpio, aviso)
 
             reg.ruta_rel = ruta
-            tamano = (cfg.upload_root / ruta).stat().st_size
             if tamano > MAX_BYTES_ARCHIVO:
                 terminar(reg, FALLIDO, f"excede 10 MB ({tamano / 1048576:.1f} MB)")
                 continue
@@ -183,7 +189,8 @@ def terminar(reg: Registro, estado: str, mensaje: str) -> None:
     etiqueta = {SUBIDO: "[OK]", FALLIDO: "[ERROR]", OMITIDO: "[OMITIDO]"}[estado]
     detalle = f"→ {reg.url}" if estado == SUBIDO else f"— {mensaje}"
     nivel = logging.ERROR if estado == FALLIDO else logging.INFO
-    log.log(nivel, "%s %s id=%s %s %s", etiqueta, reg.fuente.clave, reg.id, reg.valor, detalle)
+    valor = reg.valor if len(reg.valor) <= 150 else reg.valor[:150] + "…"
+    log.log(nivel, "%s %s id=%s %s %s", etiqueta, reg.fuente.clave, reg.id, valor, detalle)
 
 
 # ---------- Salidas ----------
